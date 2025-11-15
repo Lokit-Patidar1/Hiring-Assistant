@@ -49,6 +49,12 @@ def _init_state():
 		st.session_state.session_ended = False
 	if "asked_questions" not in st.session_state:
 		st.session_state.asked_questions: List[str] = []
+	if "info_collection_complete" not in st.session_state:
+		st.session_state.info_collection_complete = False
+	if "chat_mode" not in st.session_state:
+		st.session_state.chat_mode = False
+	if "last_processed_input" not in st.session_state:
+		st.session_state.last_processed_input = ""
 
 
 def _language_texts(lang: str) -> Dict[str, str]:
@@ -167,12 +173,14 @@ def main():
 		st.caption("Using GOOGLE_API_KEY from secrets or environment.")
 
 		if st.button("Reset Conversation", type="secondary"):
-			for k in ["messages", "candidate", "tech_list", "current_field", "session_ended", "asked_questions"]:
+			for k in ["messages", "candidate", "tech_list", "current_field", "session_ended", "asked_questions", "info_collection_complete", "chat_mode", "last_processed_input"]:
 				if k == "candidate":
 					st.session_state[k] = {"name": "", "email": "", "phone": "", "experience": "", "position": "", "location": "", "tech_stack": ""}
 				else:
-					st.session_state[k] = [] if isinstance(st.session_state.get(k), list) else ""
+					st.session_state[k] = [] if isinstance(st.session_state.get(k), list) else False if isinstance(st.session_state.get(k), bool) else ""
 			st.session_state.session_ended = False
+			st.session_state.info_collection_complete = False
+			st.session_state.chat_mode = False
 			# Do not reset selected model/language to preserve user choices
 			st.rerun()
 
@@ -224,6 +232,10 @@ def main():
 	placeholder = "Type your message..." if st.session_state.language == "English" else "अपना संदेश लिखें..."
 	user_input = st.chat_input(placeholder=placeholder, disabled=st.session_state.session_ended)
 
+	# Skip processing if this input was already processed
+	if user_input and user_input == st.session_state.last_processed_input:
+		user_input = None
+
 	if user_input:
 		# Sentiment (optional)
 		polarity, mood = blob_sentiment(user_input)
@@ -234,6 +246,7 @@ def main():
 		}.get(mood, "😐")
 
 		st.session_state.messages.append({"role": "user", "content": user_input})
+		st.session_state.last_processed_input = user_input
 
 		# End sequence
 		if is_goodbye(user_input):
@@ -255,23 +268,56 @@ def main():
 		# Collect information
 		cand = st.session_state.candidate
 		# Always capture the currently asked field only (one-question-per-turn)
+		# Update immediately when field is provided
+		info_updated = False
 		if st.session_state.current_field:
 			field = st.session_state.current_field
+			old_value = cand.get(field, "")
 			value = _extract_value_for_field(user_input, field)
 			cand[field] = value
 			if field == "tech_stack":
 				st.session_state.tech_list = parse_tech_stack(value)
+			# Mark that info was updated
+			if old_value != value:
+				info_updated = True
 
 		# Determine next action
 		missing_after = get_missing_fields(cand)
-		if not missing_after:
-			# Confirm tech stack and generate questions once
+		
+		# Check if we're in chat mode (after info collection and questions)
+		if st.session_state.info_collection_complete and st.session_state.chat_mode:
+			# Handle general questions using LLM
+			chat_prompt = f"""You are TalentScout, a helpful AI hiring assistant. The candidate has completed their initial screening. 
+They have provided: {', '.join([f"{k}: {v}" for k, v in cand.items() if v])}
+Their tech stack: {', '.join(st.session_state.tech_list) if st.session_state.tech_list else 'Not specified'}
+
+The candidate just asked: "{user_input}"
+
+Provide a helpful, concise response. If they're asking about the interview process, their application, or technical questions, be informative and friendly.
+Keep responses brief (2-3 sentences max). Respond in {st.session_state.language}."""
+			
+			with st.chat_message("assistant"):
+				with st.spinner("Thinking..."):
+					try:
+						response = st.session_state.model.generate_content(chat_prompt)
+						assistant_response = (response.text or "").strip()
+						if not assistant_response:
+							assistant_response = UNKNOWN_FALLBACK
+						st.write(assistant_response)
+						st.session_state.messages.append({"role": "assistant", "content": assistant_response})
+					except Exception as e:
+						error_msg = f"I apologize, I encountered an error. Please try again. ({str(e)})"
+						st.write(error_msg)
+						st.session_state.messages.append({"role": "assistant", "content": error_msg})
+		elif not missing_after:
+			# All info collected - generate questions if not already done
 			if st.session_state.tech_list and not st.session_state.asked_questions:
 				confirm_msg = f"{_language_texts(st.session_state.language)['confirm_tech']}" + ", ".join(st.session_state.tech_list)
 				with st.chat_message("assistant"):
 					st.write(confirm_msg)
 					st.write(lang_texts["questions_intro"])
-					qs = generate_questions(st.session_state.tech_list, st.session_state.model)
+					with st.spinner("Generating questions..."):
+						qs = generate_questions(st.session_state.tech_list, st.session_state.model)
 					if qs:
 						for q in qs:
 							st.write(f"- {q}")
@@ -280,22 +326,33 @@ def main():
 						st.write(UNKNOWN_FALLBACK)
 
 				st.session_state.messages.append({"role": "assistant", "content": confirm_msg})
+				st.session_state.info_collection_complete = True
+				st.session_state.chat_mode = True
 
-			# Provide graceful next step
-			next_prompt = "If you have any questions or would like to end, say 'bye'."
-			if st.session_state.language == "Hindi":
-				next_prompt = "यदि आपके कोई प्रश्न हों या आप समाप्त करना चाहें, तो 'bye' कहें।"
-			with st.chat_message("assistant"):
-				st.write(next_prompt)
-			st.session_state.messages.append({"role": "assistant", "content": next_prompt})
+			# Enter chat mode after questions are shown
+			if st.session_state.asked_questions and not st.session_state.chat_mode:
+				st.session_state.info_collection_complete = True
+				st.session_state.chat_mode = True
+				# Provide graceful next step when entering chat mode
+				next_prompt = "Great! I'm here to help. Feel free to ask me any questions about the interview process, your application, or anything else. If you'd like to end, say 'bye'."
+				if st.session_state.language == "Hindi":
+					next_prompt = "बढ़िया! मैं यहाँ आपकी मदद के लिए हूँ। साक्षात्कार प्रक्रिया, आपके आवेदन, या किसी अन्य चीज़ के बारे में कोई भी प्रश्न पूछने के लिए स्वतंत्र महसूस करें। यदि आप समाप्त करना चाहते हैं, तो 'bye' कहें।"
+				with st.chat_message("assistant"):
+					st.write(next_prompt)
+				st.session_state.messages.append({"role": "assistant", "content": next_prompt})
 			st.session_state.current_field = ""
 		else:
-			# Ask the next single question deterministically to reduce lag
+			# Ask the next single question deterministically to reduce lag (no LLM call)
 			st.session_state.current_field = missing_after[0]
 			next_q = _field_label(st.session_state.current_field, lang_texts)
 			with st.chat_message("assistant"):
 				st.write(next_q)
 			st.session_state.messages.append({"role": "assistant", "content": next_q})
+		
+		# If info was updated, trigger rerun at the end to update sidebar immediately
+		# This happens after all processing is complete
+		if info_updated:
+			st.rerun()
 
 
 if __name__ == "__main__":
